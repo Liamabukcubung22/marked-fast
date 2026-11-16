@@ -436,6 +436,19 @@ function parseBlocks(src) {
       else break;
     }
   }
+  // Remove up to n leading whitespace characters for fenced-code dedent.
+  // Unlike dedentCols (column-based), a tab counts as a single character:
+  // a tab that would straddle the dedent boundary is removed whole, and
+  // a tab left at the start of the content stays a literal tab (marked
+  // behaviour, doc-13/38: fence indent 2, line "  \tX" -> "\tX").
+  function dedentChars(n) {
+    while (n > 0 && L.off < L.s.length) {
+      const c = L.s.charCodeAt(L.off);
+      if (c === 32) { L.col++; L.off++; n--; }
+      else if (c === 9) { L.col += 4 - (L.col % 4); L.off++; n--; }
+      else break;
+    }
+  }
   // Measure the indent to the next non-space character (no advancing).
   function measure() {
     let off = L.off, col = L.col;
@@ -454,7 +467,11 @@ function parseBlocks(src) {
   // noExpand: for indented code content, a fresh tab after the 4-space
   // dedent stays a literal tab (doc-02/doc-06); fenced code expands it.
   function lineContent(noExpand) {
-    if (L.ptab) return ' '.repeat(4 - (L.col % 4)) + L.s.slice(L.off + 1);
+    // a tab partly consumed by a container/fence advance expands to the
+    // next tab stop measured from the innermost '>' marker (L.bqCol),
+    // like a fresh tab (doc-30: a tab right after '>' in a fenced code
+    // block expands to 2 spaces, not 3)
+    if (L.ptab) return ' '.repeat(4 - ((L.col - L.bqCol) % 4)) + L.s.slice(L.off + 1);
     // a tab at the current position expands to the next tab stop, except
     // when it is the very first character of the source line (a tab at
     // col 0 in a top-level fenced code block stays a literal tab, doc-01
@@ -490,6 +507,19 @@ function parseBlocks(src) {
       else node.lines = rest.split('\n');
     }
     return consumed;
+  }
+
+  // A paragraph whose first two lines are a table header + delimiter row
+  // is a GFM table, not a paragraph: a following setext underline is a
+  // table row, not a heading underline (doc-26: '=========' after a
+  // table is a row, and the table is only detected at finalize time).
+  function paraIsTable(node) {
+    const ls = node.lines;
+    if (!ls || ls.length < 2) return false;
+    const hdr = splitRow(ls[0]);
+    if (hdr === null) return false;
+    const al = parseDelimiterRow(ls[1]);
+    return al !== null && al.length === hdr.length;
   }
 
   function finalize(node) {
@@ -817,8 +847,13 @@ function parseBlocks(src) {
         if (L.nnCol - L.col >= b.ci) { advCols(b.ci); depth++; continue; }
         // the fenced-code bypass applies only once the fence already
         // has content (doc-02); a col-0 line right after the fence
-        // closes it empty instead (doc-38/17)
-        if (tipFenced && stack[stack.length - 1].lines.length > 0) { depth++; continue; }
+        // closes it empty instead (doc-38/17). It does not apply to a
+        // list-marker line: the marker starts a sibling item (or a new
+        // list), it is not code content (doc-36). The full marker
+        // parse is skipped unless the line's first char can start one
+        // ('-', '+', '*' or a digit), so code content lines stay cheap.
+        const maybeMarker = L.nn === 45 || L.nn === 43 || L.nn === 42 || (L.nn >= 48 && L.nn <= 57);
+        if (tipFenced && stack[stack.length - 1].lines.length > 0 && (!maybeMarker || !matchListMarker())) { depth++; continue; }
         failed = true;
         break;
       }
@@ -879,6 +914,18 @@ function parseBlocks(src) {
             const p = stack[stack.length - 2];
             if (p && p.t === 'list') p.lastBlank = true;
           }
+          // a blank line deep inside a nested item also separates the
+          // blocks of each ancestor item: mark the last child of every
+          // ancestor item, so a nested list whose item holds two blocks
+          // separated by a blank line is loose (doc-01/36: a blank line
+          // between a nested list and a fenced code block inside an
+          // item makes that item's parent list loose)
+          for (let d = stack.length - 1; d >= 1; d--) {
+            const anc = stack[d];
+            if (anc.t === 'item' && anc.ch.length > 0) {
+              anc.ch[anc.ch.length - 1].lastBlank = true;
+            }
+          }
         } else if (t.t === 'item' && t.ch.length === 0) {
           // an empty list item is closed by a blank line
           t.lastBlank = true;
@@ -888,7 +935,12 @@ function parseBlocks(src) {
           tip().lastBlank = true;
         } else if (t.t === 'code') {
           advCols(t.fenced ? t.findent : 4);
-          t.lines.push(lineContent());
+          // a whitespace-only line in a code block keeps its remaining
+          // whitespace literally (a whole tab stays a tab); a tab that
+          // straddles the dedent boundary is dropped entirely (doc-13:
+          // a lone tab in a fenced block with indent 2 renders as an
+          // empty line, not as 2 spaces)
+          t.lines.push(L.ptab ? '' : L.s.slice(L.off));
         } else if (t.t === 'html') {
           if (t.htype === 6 || t.htype === 7) {
             stack.pop();
@@ -933,8 +985,23 @@ function parseBlocks(src) {
           }
         }
         // otherwise this line is code content (handled below)
-        dedentCols(t.findent);
-        t.lines.push(lineContent());
+        if (L.ptab) {
+          // a tab partly consumed by the container advance: keep the
+          // column-based path (its remainder expands to spaces)
+          dedentCols(t.findent);
+          t.lines.push(lineContent());
+        } else if (t.findent > 0) {
+          // fence dedent removes up to findent leading whitespace
+          // characters; a tab left at the start stays literal at top
+          // level, but inside a blockquote it expands to the next tab
+          // stop measured from the '>' marker (doc-26: '>   \tX' in a
+          // ``` fence gives 4 spaces, not a literal tab)
+          dedentChars(t.findent);
+          const inBq = stack.some(b => b.t === 'bq');
+          t.lines.push(inBq ? lineContent() : lineContent(true));
+        } else {
+          t.lines.push(lineContent());
+        }
         break;
       }
       // an indented code block: a non-blank line with indent < 4 ends it
@@ -962,10 +1029,11 @@ function parseBlocks(src) {
       }
       // setext heading (paragraph -> heading). Link reference definitions
       // are stripped from the paragraph first; if nothing remains, the
-      // underline line is just a paragraph line.
+      // underline line is just a paragraph line. A paragraph that is a
+      // table is not a heading: the underline is a table row instead.
       if (t.t === 'para') {
         const se = matchSetext();
-        if (se) {
+        if (se && !paraIsTable(t)) {
           stripDefsFromPara(t);
           if (t.lines.length > 0) {
             t.t = 'head';
@@ -980,11 +1048,11 @@ function parseBlocks(src) {
       const fence = matchFence();
       if (fence) {
         closeOpenBlocks();
-        // a fence inside a blockquote is not dedented when its indent
-        // after the '>' is 2+ (doc-29/22: the spaces are content); an
-        // indent of 1 is dedented normally (doc-38)
-        const inBq = stack.some(b => b.t === 'bq');
-        const node = { t: 'code', ch: [], fenced: true, fch: fence.ch.charCodeAt(0), flen: fence.len, findent: (inBq && fence.indent >= 2) ? 0 : fence.indent, info: fence.info, lines: [], lastBlank: false };
+        // tilde fences never dedent their content (marked: a '~~~'
+        // fence keeps its indent, backtick fences dedent by the fence
+        // indent, in or out of a blockquote); an indent of 1 is
+        // dedented normally (doc-38)
+        const node = { t: 'code', ch: [], fenced: true, fch: fence.ch.charCodeAt(0), flen: fence.len, findent: fence.ch.charCodeAt(0) === 126 ? 0 : fence.indent, info: fence.info, lines: [], lastBlank: false };
         openNode(node);
         break;
       }
@@ -1106,6 +1174,22 @@ function parseBlocks(src) {
   // '\n'. Types 6-7 end at a blank line, so a following blank line absorbs
   // the newline and no trailing '\n' is emitted.
   const srcEndsNl = src.length > 0 && src.charCodeAt(src.length - 1) === 10;
+  // a line is blank inside a blockquote when it holds only whitespace and
+  // '>' markers (e.g. a lone '>'): it ends the current block just like a
+  // truly empty line, so it suppresses an html block's trailing '\n'
+  function bqBlank(idx) {
+    if (idx >= lines.length) return false;
+    const s = lines[idx];
+    if (s === '') return true;
+    let i = 0, saw = false;
+    while (i < s.length) {
+      const c = s.charCodeAt(i);
+      if (c === 32 || c === 9) { i++; continue; }
+      if (c === 62) { saw = true; i++; if (i < s.length && s.charCodeAt(i) === 32) i++; continue; }
+      break;
+    }
+    return saw && i >= s.length;
+  }
   (function markHtml(node) {
     if (node.t === 'html') {
       const next = node.lastLine + 1;
@@ -1115,8 +1199,9 @@ function parseBlocks(src) {
         // truly empty (a whitespace-only line such as a lone tab does
         // NOT suppress it, doc-15; only a truly empty line does,
         // cm-183/308/309), or when the block is the document's last
-        // block and the source ends with '\n'
-        node.trailingNl = (next < lines.length && lines[next] !== '') || (isLast && srcEndsNl);
+        // block and the source ends with '\n'. A line that is blank
+        // inside a blockquote (a lone '>') also suppresses it (doc-30).
+        node.trailingNl = (next < lines.length && lines[next] !== '' && !bqBlank(next)) || (isLast && srcEndsNl);
       } else {
         node.trailingNl = isLast && srcEndsNl;
       }
@@ -1368,12 +1453,28 @@ function matchGfmAutolink(s, i, prev, inLink, hasUnderscoreOpener, hasOpenBracke
       // but only when the '(' after it starts a URL (doc-08:
       // '](https://...)' is a separate autolink); a relative
       // destination such as '](./docs/create.md)' stays part of the
-      // URL (doc-12)
+      // URL (doc-12). A clean '(URL)' group does NOT stop it either
+      // (doc-22): the '(' is a complete destination and the URL
+      // continues past ']' to swallow it; only when the URL inside
+      // the parens is followed by a space (a title, doc-08) does
+      // the URL stop at ']'
       if (c === 93 && hasOpenBracket) {
         let stopHere = true;
         if (end + 1 < n && s.charCodeAt(end + 1) === 40) {
           const after = s.slice(end + 2, end + 10).toLowerCase();
           if (!(after.startsWith('http://') || after.startsWith('https://') || after.startsWith('ftp://') || after.startsWith('www.'))) stopHere = false;
+          else {
+            // a clean '(URL)' group (URL immediately followed by ')')
+            // does not stop the autolink
+            let q = end + 2;
+            while (q < n) {
+              const qc = s.charCodeAt(q);
+              if (qc === 32 || qc === 9 || qc === 10 || qc === 13) break;
+              if (qc === 41) break;
+              q++;
+            }
+            if (q < n && s.charCodeAt(q) === 41) stopHere = false;
+          }
         }
         if (stopHere) { end++; break; }
       }
@@ -1463,11 +1564,196 @@ function parseInlineLink(s, i, refs) {
   return { href: dest.dest, title, end: p + 1 };
 }
 
+// Is a link label's backtick usage well-formed, i.e. can the label be
+// consumed by plain chars, escapes, one-level nested brackets, and
+// backtick units (an opening run, non-empty non-backtick content, a
+// closing run of any length)? A backtick run is also allowed as the very
+// last thing in the label when it has length >= 2. A `]` inside the label
+// is allowed when another `]` follows it later with no `[` in between
+// (balanced-bracket labels such as 'a [b [c] d] e').
+function labelValid(t) {
+  // fast path: a label with no backtick, bracket, or backslash is
+  // trivially well-formed (native indexOf, no per-char scan)
+  if (t.indexOf('`') < 0 && t.indexOf('[') < 0 && t.indexOf(']') < 0 && t.indexOf('\\') < 0) return true;
+  const n = t.length;
+  let p = 0;
+  while (p < n) {
+    const ch = t.charCodeAt(p);
+    if (ch === 92) { // backslash escape
+      if (p + 1 >= n) return false;
+      p += 2;
+      continue;
+    }
+    if (ch === 91) { // nested bracket [ ... ] with no ] inside
+      let q = p + 1;
+      while (q < n && t.charCodeAt(q) !== 93) q++;
+      if (q >= n) return false;
+      p = q + 1;
+      continue;
+    }
+    if (ch === 93) { // a ] is allowed only if another ] follows (no [ first);
+      // reaching the end of the label counts: the closing ] itself
+      // is the next ] (balanced-bracket labels, 'a [b [c] d] e')
+      let q = p + 1;
+      while (q < n && t.charCodeAt(q) !== 93 && t.charCodeAt(q) !== 91) q++;
+      if (q < n && t.charCodeAt(q) === 91) return false;
+      p++;
+      continue;
+    }
+    if (ch === 96) { // backtick run
+      let q = p;
+      while (q < n && t.charCodeAt(q) === 96) q++;
+      // content: non-backtick chars after the run
+      let r = q;
+      while (r < n && t.charCodeAt(r) !== 96) r++;
+      if (r > q) {
+        // non-empty content needs a closing backtick run right after it
+        if (r >= n || t.charCodeAt(r) !== 96) return false;
+        let e = r;
+        while (e < n && t.charCodeAt(e) === 96) e++;
+        p = e;
+        continue;
+      }
+      // empty content: only a trailing run of length >= 2 is allowed
+      if (q - p >= 2 && q === n) { p = q; continue; }
+      return false;
+    }
+    p++;
+  }
+  return true;
+}
+
+// Phantom lengths of a link label, as a bitmask (bit k = a phantom of
+// length k exists): each unescaped backtick run of length L contributes
+// lengths 1..L. A label whose backticks all matched has no phantoms;
+// a label with literal (unmatched) backticks leaks (see `leak`).
+// Run lengths are capped at 29 (longer runs are not plausible here).
+function labelPhantoms(t) {
+  let m = 0;
+  const n = t.length;
+  let p = 0;
+  while (p < n) {
+    const ch = t.charCodeAt(p);
+    if (ch === 92) { p += 2; continue; } // backslash escape
+    if (ch === 96) {
+      let q = p;
+      while (q < n && t.charCodeAt(q) === 96) q++;
+      let L = q - p;
+      if (L > 29) L = 29;
+      m |= (1 << (L + 1)) - 2; // bits 1..L
+      p = q;
+      continue;
+    }
+    p++;
+  }
+  return m;
+}
+
+// Would the innermost bracket form a link if it closed at s[k] === ']'?
+// Mirrors the closing-bracket handler: an inline destination or a full
+// reference needs a well-formed label; a collapsed or shortcut reference
+// does not.
+// Find the ']' that closes bracket br, scanning forward from fromPos,
+// and report whether a link would form there. Nested brackets, escapes
+// and code spans are skipped so a ']' inside them does not count.
+// Used to decide whether a GFM autolink inside a bracket must be
+// suppressed: only a bracket that will actually form a link suppresses
+// it (doc-39: '[... https://...][undefined]' autolinks the URL).
+function bracketFormsLink(s, fromPos, br, refs) {
+  const n = s.length;
+  let depth = 0;
+  let k = fromPos;
+  while (k < n) {
+    const c = s.charCodeAt(k);
+    if (c === 92) { k += 2; continue; }
+    if (c === 96) {
+      let j = k, run = 0;
+      while (j < n && s.charCodeAt(j) === 96) { run++; j++; }
+      let m = j, found = -1;
+      while (m < n) {
+        if (s.charCodeAt(m) === 96) {
+          let p = m, r2 = 0;
+          while (p < n && s.charCodeAt(p) === 96) { r2++; p++; }
+          if (r2 === run) { found = p; break; }
+          m = p;
+        } else m++;
+      }
+      k = found >= 0 ? found : n;
+      continue;
+    }
+    if (c === 91) { depth++; k++; continue; }
+    if (c === 93) {
+      if (depth === 0) return wouldFormLink(s, k, br, refs);
+      depth--; k++; continue;
+    }
+    k++;
+  }
+  return false;
+}
+
+function wouldFormLink(s, k, br, refs) {
+  if (!br || !br.active || br.linkBlocked) return false;
+  const text = s.slice(br.srcPos, k);
+  const lv = labelValid(text);
+  if (lv && k + 1 < s.length && s.charCodeAt(k + 1) === 40) {
+    const il = parseInlineLink(s, k + 1, refs);
+    if (il && cleanUrl(il.href) !== null) return true;
+  }
+  // with no reference definitions, no reference link can form
+  if (refs.size === 0) return false;
+  let fullRefAttempted = false;
+  if (k + 1 < s.length && s.charCodeAt(k + 1) === 91) {
+    if (k + 2 < s.length && s.charCodeAt(k + 2) === 93) {
+      // collapsed reference "[]": the shortcut form, so it does not
+      // need a well-formed label
+      fullRefAttempted = true;
+      const ref = refs.get(normalizeLabel(text));
+      if (ref && cleanUrl(ref.href) !== null) return true;
+    } else if (lv) {
+      // full reference [label]: needs a well-formed label
+      const lab = parseLabel(s, k + 1);
+      if (lab) {
+        fullRefAttempted = true;
+        const ref = refs.get(lab.label);
+        if (ref && cleanUrl(ref.href) !== null) return true;
+      }
+    }
+  }
+  if (!fullRefAttempted) {
+    const ref = refs.get(normalizeLabel(text));
+    if (ref && cleanUrl(ref.href) !== null) return true;
+  }
+  return false;
+}
+
+// Document-level "inside a link" flag (marked quirk): an inline `<a `
+// open tag (a literal space after `<a`, any case) that is not closed
+// by an inline `</a>` in the same inline run leaves the lexer thinking
+// it is inside a link for the REST OF THE DOCUMENT, suppressing all
+// later GFM autolinks (email / URL / www) — but not `<...>` autolinks
+// and not markdown links. A `</a>` inline in a later paragraph DOES
+// clear it; a `</a>` alone as an HTML block does not (it is never
+// inline-lexed). Reset at the start of each parse(); shared by the
+// recursive renderInline calls for link text / alt text.
+let docInLink = false;
+
 // The inline renderer. `plain` renders to plain text (for image alt text).
 function renderInline(s, refs, plain, noLink) {
   const n = s.length;
   const out = [];
   const delims = []; // {ch, n, open, close, pos, active, src}
+  // Backtick leak: delimiter count at the time an inline link/image
+  // whose label had literal (unmatched) backticks formed, plus the
+  // phantom lengths that label left behind (see `labelPhantoms`).
+  // A backtick run encountered later discharges the emphasis
+  // delimiters added past the leak point (they stay literal) only
+  // when its length matches a remaining phantom length, and it
+  // consumes phantom lengths below its own. A run with no matching
+  // phantom discharges nothing. Reference links never set it; the
+  // marker stays at the earliest leak (a later poisoned link merges
+  // its phantoms into the set without moving the marker).
+  let leak = -1;
+  let phantoms = 0;
   const brackets = []; // {pos, image, active, srcPos}
   let buf = '';
   let i = 0;
@@ -1484,7 +1770,7 @@ function renderInline(s, refs, plain, noLink) {
   function addDelim(ch, run, open, close, src) {
     flush();
     out.push(run);
-    delims.push({ ch, n: run.length, open, close, pos: out.length - 1, active: true, src });
+    delims.push({ ch, n: run.length, open, close, pos: out.length - 1, active: true, src, end: src + run.length });
   }
   // Process emphasis: standard delimiter-stack algorithm. Delimiter chunks
   // are rebuilt from the delimiter's remaining run length plus accumulated
@@ -1525,6 +1811,22 @@ function renderInline(s, refs, plain, noLink) {
             // bottom must not be raised for a later closer (doc-11:
             // the outer '**' must still find its opener)
             if (spansBlocked) { skipped = true; oi--; continue; }
+            // a single '*' closer that cannot open must not steal one
+            // delimiter from a '**' opener when a later '**' closer
+            // could form a strong with it ('**a *b*c* d**': the '*'
+            // before ' d' stays literal and the final '**' forms the
+            // strong). Only when the opener has exactly 2 delimiters
+            // (taking 1 would leave 1, too few for a strong); with 3+
+            // the single '*' may still match and leave 2 for the
+            // strong (cm-430: '***foo* bar**').
+            if (closer.n === 1 && !closer.open && opener.n === 2) {
+              let laterStrong = false;
+              for (let d = ci + 1; d < delims.length; d++) {
+                const dd = delims[d];
+                if (dd.active && dd.ch === ch && dd.close && dd.n >= 2) { laterStrong = true; break; }
+              }
+              if (laterStrong) { skipped = true; oi--; continue; }
+            }
           }
           if ((opener.open && opener.close) || (closer.open && closer.close)) {
             if ((opener.n + closer.n) % 3 === 0 && (opener.n % 3 !== 0 || closer.n % 3 !== 0)) {
@@ -1546,7 +1848,7 @@ function renderInline(s, refs, plain, noLink) {
       }
       const opener = delims[found];
       const use = opener.n >= 2 && closer.n >= 2 ? 2 : 1;
-      formed.push([found, ci]);
+      formed.push([found, ci, ch, use]);
       // A strong formed from a pure opener (can open, cannot close) and
       // a closer that can also open blocks a later SINGLE '*' from
       // spanning it ('*a **b**c*' stays literal outside), but not a
@@ -1570,7 +1872,33 @@ function renderInline(s, refs, plain, noLink) {
         // tag goes after the earlier (inner) one
         closer.ctag = (closer.ctag || '') + closeTag;
         out[opener.pos] = ch.repeat(opener.n) + opener.otag;
-        out[closer.pos] = closer.ctag + ch.repeat(closer.n);
+        // A strong closer's leftover normally follows its close tag
+        // ('**a b***' -> '<strong>a b</strong>*'), but when the strong
+        // contains a '*' em that runs straight into the closer — the
+        // char right after that em's closer is not whitespace, and no
+        // unmatched delimiter lies between that em and this closer —
+        // the leftover belongs inside the strong ('**a *b*c***' ->
+        // '<strong>a <em>b</em>c*</strong>'). A '_' em, a nested
+        // strong, a code span or a link inside does not count.
+        let leftoverFirst = false;
+        if (use === 2 && ch === '*' && closer.n > 0) {
+          for (let f = 0; f < formed.length; f++) {
+            const fr = formed[f];
+            if (fr[2] !== '*' || fr[3] !== 1) continue;
+            if (!(fr[0] > found && fr[1] < ci)) continue;
+            const ec = delims[fr[1]];
+            const after = ec.end < n ? s.charCodeAt(ec.end) : -1;
+            if (after !== -1 && isSpaceCode(after)) continue;
+            let blocked = false;
+            for (let d = fr[1] + 1; d < ci; d++) {
+              if (delims[d].active) { blocked = true; break; }
+            }
+            if (blocked) continue;
+            leftoverFirst = true;
+            break;
+          }
+        }
+        out[closer.pos] = leftoverFirst ? ch.repeat(closer.n) + closer.ctag : closer.ctag + ch.repeat(closer.n);
       }
       if (opener.n === 0) {
         opener.active = false;
@@ -1609,20 +1937,27 @@ function renderInline(s, refs, plain, noLink) {
     if (c === 96) {
       let j = i, run = 0;
       while (j < n && s.charCodeAt(j) === 96) { run++; j++; }
-      // find a matching run of exactly `run` backticks. A ']' that
-      // closes an open bracket ends the search when a backtick run of
-      // a DIFFERENT length has already intervened, or when an earlier
-      // backtick run inside this bracket already failed to form a span
-      // (the bracket is 'poisoned'): '[docs each ``url`](...)' forms
-      // the link (the `` is literal, and the lone ` after url cannot
-      // span the ']' either), while '[foo `bar]baz`](/url)' forms the
-      // code span (no intervening run, bracket unpoisoned, so the ']'
-      // is inside the span).
+      // A pending backtick leak is discharged only by a run whose
+      // length matches a remaining phantom length (see `leak`):
+      // drop the emphasis delimiters added past the leak point (they
+      // stay literal) and consume phantom lengths below the run's.
+      // A run with no matching phantom — or one encountered before
+      // any such delimiter — leaves the leak pending for a later run.
+      if (leak !== -1 && run <= 29 && (phantoms & (1 << run)) !== 0) {
+        if (delims.length > leak) delims.length = leak;
+        phantoms &= ~((1 << run) - 2);
+      }
+      // A ']' that closes an open bracket ends the search only when
+      // that bracket would actually form a link there: a backtick run
+      // inside a bracket that will not form a link may span the ']'
+      // and pair with a later run ('[a ``b`] _x_ `c`'), while a run
+      // inside a bracket that will form a link stays literal
+      // ('[docs each ``url`](...)').
       const innerBr = brackets.length > 0 ? brackets[brackets.length - 1] : null;
       let k = j, found = -1, sawOther = false;
       while (k < n) {
         const ck = s.charCodeAt(k);
-        if (ck === 93 && brackets.length > 0 && (sawOther || (innerBr && innerBr.poisoned))) break;
+        if (ck === 93 && brackets.length > 0 && wouldFormLink(s, k, innerBr, refs)) break;
         if (ck === 96) {
           let m = k, r2 = 0;
           while (m < n && s.charCodeAt(m) === 96) { r2++; m++; }
@@ -1633,7 +1968,8 @@ function renderInline(s, refs, plain, noLink) {
       }
       if (found < 0) {
         // an unmatched backtick run poisons the innermost bracket:
-        // no later backtick in it may span its closing ']'
+        // its label had literal backticks, so a link formed from it
+        // leaks (see `leak`)
         if (innerBr) innerBr.poisoned = true;
         buf += s.slice(i, j);
         i = j;
@@ -1723,40 +2059,57 @@ function renderInline(s, refs, plain, noLink) {
         const br = brackets[brackets.length - 1];
         if (br.active && !br.linkBlocked) {
           const text = s.slice(br.srcPos, i);
+          // An inline destination or a full/collapsed reference needs
+          // a well-formed label (backtick units); a shortcut reference
+          // does not ('[a `b` ``c]' forms with a matching definition,
+          // '[a `b` ``c](u)' does not).
+          const lv = labelValid(text);
           let href = null, title = null, end = -1;
-          if (i + 1 < n && s.charCodeAt(i + 1) === 40) {
+          let inlineForm = false;
+          if (lv && i + 1 < n && s.charCodeAt(i + 1) === 40) {
             const il = parseInlineLink(s, i + 1, refs);
-            if (il) { href = il.href; title = il.title; end = il.end; }
+            if (il) { href = il.href; title = il.title; end = il.end; inlineForm = true; }
           }
-          if (href === null) {
-            // full / collapsed reference. If the label syntax parses but
-            // the reference is undefined, the shortcut is NOT tried
-            // (cm-571); if the label syntax itself fails, it is (cm-568).
-            let fullRefAttempted = false;
-            if (i + 1 < n && s.charCodeAt(i + 1) === 91) {
-              // collapsed reference "[]": the label is the link text
-              if (i + 2 < n && s.charCodeAt(i + 2) === 93) {
+          let fullRefAttempted = false;
+          if (href === null && i + 1 < n && s.charCodeAt(i + 1) === 91) {
+            if (i + 2 < n && s.charCodeAt(i + 2) === 93) {
+              // collapsed reference "[]": the label is the link text.
+              // This is the shortcut form, so it does not need a
+              // well-formed label ('[a `b` ``c][]' forms with a
+              // matching definition).
+              fullRefAttempted = true;
+              const ref = refs.get(normalizeLabel(text));
+              if (ref) { href = ref.href; title = ref.title; end = i + 3; }
+            } else if (lv) {
+              // full reference [label]: needs a well-formed label
+              const lab = parseLabel(s, i + 1);
+              if (lab) {
                 fullRefAttempted = true;
-                const ref = refs.get(normalizeLabel(text));
-                if (ref) { href = ref.href; title = ref.title; end = i + 3; }
-              } else {
-                const lab = parseLabel(s, i + 1);
-                if (lab) {
-                  fullRefAttempted = true;
-                  const ref = refs.get(lab.label);
-                  if (ref) { href = ref.href; title = ref.title; end = lab.end; }
-                }
+                const ref = refs.get(lab.label);
+                if (ref) { href = ref.href; title = ref.title; end = lab.end; }
               }
             }
-            if (href === null && !fullRefAttempted) {
-              const lab = normalizeLabel(text);
-              const ref = refs.get(lab);
-              if (ref) { href = ref.href; title = ref.title; end = i + 1; }
-            }
+          }
+          // shortcut reference: tried whenever no full reference was
+          // attempted, including when the label is not well-formed
+          // (an ill-formed label can still be a shortcut key)
+          if (href === null && !fullRefAttempted) {
+            const lab = normalizeLabel(text);
+            const ref = refs.get(lab);
+            if (ref) { href = ref.href; title = ref.title; end = i + 1; }
           }
           if (href !== null) {
             const clean = cleanUrl(href);
             if (clean !== null) {
+              // An inline link/image whose label had literal
+              // (unmatched) backticks leaks: its phantom lengths are
+              // left pending (see `leak`); a later poisoned link
+              // merges its phantoms in without moving the marker.
+              if (inlineForm && br.poisoned) {
+                const ph = labelPhantoms(text);
+                if (leak === -1) { leak = delims.length; phantoms = ph; }
+                else phantoms |= ph;
+              }
               flush();
               if (br.image) {
                 const alt = renderInline(text, refs, true);
@@ -1830,6 +2183,15 @@ function renderInline(s, refs, plain, noLink) {
       }
       const tagEnd = matchHtmlTag(s, i);
       if (tagEnd > 0) {
+        // an inline `<a ` open tag sets the document-level in-link
+        // flag; an inline `</a>` (exactly, any case) clears it
+        // (see `docInLink`); other tags leave it alone. Only when
+        // the tag is actually emitted (not plain/alt mode).
+        if (!plain) {
+          const a1 = s.charCodeAt(i + 1);
+          if ((a1 === 97 || a1 === 65) && s.charCodeAt(i + 2) === 32) docInLink = true;
+          else if (tagEnd - i === 4 && a1 === 47 && (s.charCodeAt(i + 2) === 97 || s.charCodeAt(i + 2) === 65) && s.charCodeAt(i + 3) === 62) docInLink = false;
+        }
         flush();
         if (!plain) out.push(s.slice(i, tagEnd));
         i = tagEnd;
@@ -1892,14 +2254,23 @@ function renderInline(s, refs, plain, noLink) {
           if (delims[d].ch === '_' && delims[d].open && delims[d].active) { hasUnderscoreOpener = true; break; }
         }
         // GFM autolinks are suppressed inside link text (noLink) and
-        // inside an ACTIVE bracket (it may still form a link, whose
-        // text must not contain an autolink); a DEACTIVATED bracket
-        // (an inner link already formed, doc-08) does not suppress
-        let anyActiveBracket = false;
-        for (let b = 0; b < brackets.length; b++) {
-          if (brackets[b].active) { anyActiveBracket = true; break; }
+        // inside a bracket that will actually form a link (its text
+        // must not contain an autolink); a bracket that will NOT form
+        // a link (undefined reference, doc-39) does not suppress, and
+        // a DEACTIVATED bracket (an inner link already formed, doc-08)
+        // does not suppress either. They are also suppressed once an
+        // unclosed inline `<a ` tag has left the document-level
+        // in-link flag set (doc-03/06).
+        let suppress = noLink || docInLink;
+        if (!suppress) {
+          for (let b = brackets.length - 1; b >= 0; b--) {
+            if (brackets[b].active) {
+              if (bracketFormsLink(s, i, brackets[b], refs)) { suppress = true; }
+              break;
+            }
+          }
         }
-        const ga = matchGfmAutolink(s, i, prev, noLink || anyActiveBracket, hasUnderscoreOpener, brackets.length > 0);
+        const ga = matchGfmAutolink(s, i, prev, suppress, hasUnderscoreOpener, brackets.length > 0);
         if (ga) {
           const clean = cleanUrl(ga.href);
           if (clean !== null) {
@@ -2040,6 +2411,7 @@ function renderBlock(node, refs, out, loose) {
 
 export function parse(src) {
   src = src.replace(/\r\n?/g, '\n');
+  docInLink = false;
   const { doc, refs } = parseBlocks(src);
   const out = [];
   renderBlock(doc, refs, out, false);
