@@ -80,7 +80,7 @@ right after the fence closes it empty).
 - doc-11: `***` closer remainder placement (`**return that *old*two***`).
 - doc-06, doc-22, doc-38: link destinations with `]`/`(`/`<` and nested
   fenced-code/list/blockquote structure.
-- doc-13, doc-23: link-reference scoping (definitions inside code blocks).
+- doc-13: link-reference scoping (definitions inside code blocks).
 - doc-17, doc-26, doc-28, doc-30, doc-33, doc-35, doc-36, doc-39: fenced
   code / blockquote / list nesting (including a stale list item left open
   that shifts a later fence's tab handling).
